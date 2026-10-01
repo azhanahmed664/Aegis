@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+yfinance
+ccxt
+lightweight-charts
+xgboost
+scikit-learn
+requests
+feedparser
+vectorbt
