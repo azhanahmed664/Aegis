@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime
 import yfinance as yf
@@ -9,9 +10,10 @@ from telegram_engine import TelegramBroadcaster
 from outcome_tracker import TradeOutcomeTracker
 from htf_engine import HTFConfluenceEngine
 
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
-ML_CONFIDENCE_THRESHOLD = 0.55
+# Demo credentials explicitly loaded
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8985731081:AAEd5EYlLq7y-wsrtCE7r_ZZ2-5Vs-_2oI8")
+TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "8037730810"))
+ML_CONFIDENCE_THRESHOLD = float(os.getenv("ML_CONFIDENCE_THRESHOLD", "0.55"))
 
 def fetch_live_xau_5m(limit=200) -> pd.DataFrame:
     ticker = yf.Ticker("GC=F")
@@ -44,6 +46,7 @@ def run_aegis_signal_loop():
         found = strat.scan_all_strategies()
         return f"Detected {len(found)} candidate setups on 5m."
 
+    # Initialize the background thread looking for /status and /scan commands
     broadcaster.start_command_listener(status_callback=get_status_summary, scan_callback=trigger_scan)
 
     last_bar = None
@@ -55,6 +58,7 @@ def run_aegis_signal_loop():
                 latest = df.iloc[-1]
                 bar_time = latest['Timestamp']
 
+                # 1. Update ML Memory outcomes if price hit TP or SL
                 tracker.evaluate_open_trades(latest['High'], latest['Low'], broadcaster=broadcaster)
 
                 if bar_time != last_bar:
@@ -67,7 +71,7 @@ def run_aegis_signal_loop():
                     signals = strategy_engine.scan_all_strategies(idx=len(df)-1)
 
                     for sig in signals:
-                        # HTF Gate Check
+                        # 2. HTF Gate Check Validation
                         if "BULLISH" in macro_bias and sig['action'] == "SHORT":
                             print(f"🛑 SHORT rejected by {macro_bias} macro trend.")
                             continue
@@ -75,6 +79,7 @@ def run_aegis_signal_loop():
                             print(f"🛑 LONG rejected by {macro_bias} macro trend.")
                             continue
 
+                        # 3. Extract Lancaster Features & ML Probability Gate
                         features = ml_engine.extract_lancaster_features(strategy_engine.df, len(df)-1)
                         win_prob = ml_engine.predict_win_probability(features)
 
@@ -86,6 +91,7 @@ def run_aegis_signal_loop():
                                 f"Lancaster ML Confidence: {win_prob*100:.0f}%"
                             ]
 
+                            # 4. Synchronize Trade setup to Supabase Cloud
                             tracker.register_trade(
                                 asset="XAU/USD",
                                 strategy=sig['strategy'],
@@ -96,6 +102,7 @@ def run_aegis_signal_loop():
                                 features=features
                             )
 
+                            # 5. Broadcast final execution command to Telegram
                             msg = broadcaster.format_signal(
                                 asset="XAU/USD (Gold)",
                                 strategy=sig['strategy'],
@@ -109,6 +116,7 @@ def run_aegis_signal_loop():
                         else:
                             print(f"⚠ Suppressed: Prob ({win_prob*100:.1f}%) < Threshold.")
 
+            # Sleep 60 seconds before next polling cycle
             time.sleep(60)
         except Exception as e:
             print(f"❌ Signal Loop Error: {e}")

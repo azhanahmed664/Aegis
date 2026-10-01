@@ -1,11 +1,14 @@
+import os
 import requests
 import json
 
 class SupabaseEngine:
     def __init__(self):
-        # Read from environment or fallback
-        self.url = "https://YOUR_SUPABASE_PROJECT_REF.supabase.co/rest/v1"
-        self.key = "YOUR_SUPABASE_ANON_KEY"
+        # Demo credentials explicitly loaded
+        raw_url = os.getenv("SUPABASE_URL", "https://dsoxzpbataleytsamzqi.supabase.co/rest/v1/")
+        self.url = raw_url.rstrip('/')  # Strip trailing slash to prevent double slashes in API endpoints
+        self.key = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRzb3h6cGJhdGFsZXl0c2FtenFpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA4NDcxMzYsImV4cCI6MjEwNjQyMzEzNn0.iJVPJFcrPrtga6y6i2VnjiS8qwDNETGO456bOMuG7Mw")
+        
         self.headers = {
             "apikey": self.key,
             "Authorization": f"Bearer {self.key}",
@@ -14,7 +17,8 @@ class SupabaseEngine:
         }
 
     def is_configured(self) -> bool:
-        return "YOUR_SUPABASE" not in self.url
+        # Validate that a real key is present rather than a placeholder string
+        return bool(self.key and len(self.key) > 50)
 
     def insert_trade_memory(self, record: dict):
         if not self.is_configured(): return
@@ -34,7 +38,7 @@ class SupabaseEngine:
     def save_active_trades(self, trades: list):
         if not self.is_configured(): return
         try:
-            # Upsert active trades
+            # Broadcast the active position queue to the cloud
             for t in trades:
                 requests.post(f"{self.url}/aegis_active_trades", headers=self.headers, json=t, timeout=5)
         except Exception as e:
@@ -51,6 +55,7 @@ class SupabaseEngine:
     def close_active_trade(self, trade_id: str):
         if not self.is_configured(): return
         try:
+            # Delete resolved trades from the active queue monitor
             requests.delete(f"{self.url}/aegis_active_trades?id=eq.{trade_id}", headers=self.headers, timeout=5)
         except Exception as e:
             print(f"Supabase Trade Close Error: {e}")
