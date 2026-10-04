@@ -212,7 +212,9 @@ def run_aegis_signal_loop() -> None:
             saved = db.save_state(table, key, payload)
         except Exception as exc:
             saved = False
-            print(f"Supabase state write failed for {table}/{key}: {exc}")
+            print(f"Supabase state write failed for {table}/{key}: {exc!r}")
+        if not saved:
+            print(f"Supabase state write failed for {table}/{key}: save_state returned False")
         if not saved and not state_write_warning["shown"]:
             print("State snapshots are not persisting; configure SUPABASE_SERVICE_ROLE_KEY and apply supabase_state_tables.sql")
             state_write_warning["shown"] = True
@@ -223,7 +225,9 @@ def run_aegis_signal_loop() -> None:
             saved = db.save_states(table, rows)
         except Exception as exc:
             saved = False
-            print(f"Supabase state batch write failed for {table}: {exc}")
+            print(f"Supabase state batch write failed for {table}: {exc!r}")
+        if not saved:
+            print(f"Supabase state batch write failed for {table}: save_states returned False")
         if not saved and not state_write_warning["shown"]:
             print("State snapshots are not persisting; configure SUPABASE_SERVICE_ROLE_KEY and apply supabase_state_tables.sql")
             state_write_warning["shown"] = True
@@ -265,12 +269,19 @@ def run_aegis_signal_loop() -> None:
                 print(f"Supabase startup state prime failed: {exc}")
 
     def macro_loop() -> None:
+        # The first harvest is run synchronously below before the daemon enters
+        # its polling loop. Keep this worker on the 30-minute cadence thereafter.
+        if stop_event.wait(MACRO_INTERVAL_SECONDS):
+            return
         while not stop_event.is_set():
             try:
                 payload = macro_harvester.run_cycle()
                 saved = persist_state("aegis_macro_briefing", "latest", payload)
                 if saved:
-                    print(f"Macro briefing persisted: {payload['reachable_sources']}/{payload['source_count']} sources reachable")
+                    print(
+                        "Macro briefing persisted: "
+                        f"{payload.get('reachable_sources', 0)}/{payload.get('source_count', 0)} sources reachable"
+                    )
                 else:
                     print("Macro briefing generated; Supabase snapshot write unavailable")
             except Exception as exc:
@@ -279,7 +290,6 @@ def run_aegis_signal_loop() -> None:
                 break
 
     macro_thread = threading.Thread(target=macro_loop, name="aegis-macro-harvester", daemon=True)
-    macro_thread.start()
 
     broadcaster = TelegramBroadcaster(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     # Both constructors perform a Supabase history read; overlap those waits
@@ -332,6 +342,9 @@ def run_aegis_signal_loop() -> None:
                 print(f"{symbol}: orderflow persistence error: {exc}")
 
     def orderflow_loop() -> None:
+        # The first depth scan is run synchronously before the polling loop.
+        if stop_event.wait(seconds_until_next_close()):
+            return
         while not stop_event.is_set():
             try:
                 scan_orderflow()
@@ -344,7 +357,6 @@ def run_aegis_signal_loop() -> None:
     orderflow_thread = threading.Thread(
         target=orderflow_loop, name="aegis-binance-orderflow", daemon=True
     )
-    orderflow_thread.start()
 
     def run_scan_cycle(source: str) -> str:
         reports: list[str] = []
@@ -445,11 +457,32 @@ def run_aegis_signal_loop() -> None:
         trades_callback=get_recent_trades_summary,
     )
 
-    # Do real market work immediately; subsequent cycles stay clock-aligned.
+    # Prime every dashboard data source before entering the timed market loop.
     try:
         run_scan_cycle("startup")
     except Exception as exc:
         print(f"Startup market scan failed; scheduled worker remains active: {exc}")
+    try:
+        scan_orderflow()
+    except Exception as exc:
+        print(f"Startup orderflow scan failed; scheduled worker remains active: {exc}")
+    try:
+        payload = macro_harvester.run_cycle()
+        if not isinstance(payload, dict):
+            raise TypeError("MacroHarvester.run_cycle() must return a dictionary payload")
+        if persist_state("aegis_macro_briefing", "latest", payload):
+            print(
+                "Startup macro briefing persisted: "
+                f"{payload.get('reachable_sources', 0)}/{payload.get('source_count', 0)} sources reachable"
+            )
+        else:
+            print("Startup macro briefing generated, but Supabase write returned False")
+    except Exception as exc:
+        print(f"Startup macro harvest/persistence failed: {exc!r}")
+
+    # Start periodic workers only after all three first-pulse tasks have run.
+    macro_thread.start()
+    orderflow_thread.start()
 
     try:
         while True:

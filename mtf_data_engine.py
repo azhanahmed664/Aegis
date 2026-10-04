@@ -195,7 +195,12 @@ def _recent_gold(timeframe, cutoff, hours):
             interval=timeframe, start=start.to_pydatetime(),
             end=cutoff.to_pydatetime(), auto_adjust=False,
             actions=False, timeout=20, raise_errors=True)
-        if raw.empty or not isinstance(raw.index, pd.DatetimeIndex):
+        # Yahoo returns an empty frame while the futures market is closed.
+        # Treat that as "no new candles" so a weekend refresh can retain the
+        # last complete cached session instead of turning into a data error.
+        if raw.empty:
+            return pd.DataFrame(columns=COLUMNS)
+        if not isinstance(raw.index, pd.DatetimeIndex):
             raise MTFDataError(f'No recent Gold data for {timeframe}')
         if raw.index.tz is None:
             raise MTFDataError('Gold timestamps must be timezone-aware')
@@ -216,6 +221,9 @@ def _recent_gold_block(cutoff):
             '5m': pool.submit(_recent_gold, '5m', cutoff, 1),
         }
         block = {tf: job.result() for tf, job in jobs.items()}
+    if block['1h'].empty:
+        block['4h'] = pd.DataFrame(columns=COLUMNS)
+        return block
     hourly = block['1h'].set_index('Timestamp')
     groups = hourly.resample('4h', origin='epoch', closed='left', label='left')
     bars = groups.agg({'Open': 'first', 'High': 'max', 'Low': 'min',
@@ -274,6 +282,9 @@ def update_mtf_data(cached_data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFr
     try:
         recent = (_recent_gold_block(cutoff) if symbol == 'XAU/USD'
                   else _recent_crypto_block(symbol, cutoff))
+        if symbol == 'XAU/USD' and all(recent[tf].empty for tf in TIMEFRAMES):
+            print('XAU/USD: Weekend/Market closed - retaining previous session cache')
+            return cached_data
         limit = min(len(cached_data[tf]) for tf in TIMEFRAMES)
         if limit < 1:
             raise ValueError('Cached MTF frames have no rows')

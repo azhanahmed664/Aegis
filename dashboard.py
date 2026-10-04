@@ -7,22 +7,23 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from html import escape
 from typing import Any
-from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from supabase_engine import SupabaseEngine
 
 
+BOOTING_MESSAGE = "System Booting - Awaiting first daemon pulse"
 st.set_page_config(
     page_title="AEGIS // Institutional Terminal",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+st_autorefresh(interval=15_000, key="live_loop")
 
 st.markdown("""
 <style>
@@ -132,9 +133,8 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def _fetch_fallback_candles(symbol: str, count: int = 100) -> dict[str, Any]:
-    """Browser-safe public candle fallback using provider HTTP/history APIs."""
+def _fetch_live_candles(symbol: str, count: int = 150) -> dict[str, Any]:
+    """Fetch closed chart candles directly from Yahoo or Bybit on each rerun."""
     now = pd.Timestamp.now(tz="UTC")
     if _asset_key(symbol) == "XAU/USD":
         import yfinance as yf
@@ -163,45 +163,54 @@ def _fetch_fallback_candles(symbol: str, count: int = 100) -> dict[str, Any]:
                 result["error"] = str(exc)[:180]
         return result
 
-    base = str(symbol).strip().upper().split(":", 1)[0].replace("/", "")
-    if not base.endswith("USDT"):
-        return {"candles": [], "candles_1h": [], "error": "Only USDT perpetual chart fallback is supported."}
-
-    def fetch(interval: str) -> list[dict[str, Any]]:
-        query = urlencode({"category": "linear", "symbol": base, "interval": interval, "limit": count})
-        response = requests.get(
-            f"https://api.bybit.com/v5/market/kline?{query}",
-            headers={"User-Agent": "AegisReadOnlyChart/3.0"},
-            timeout=(3, 6),
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("retCode") != 0:
-            raise RuntimeError(str(payload.get("retMsg", "Bybit returned an error")))
-        duration = pd.Timedelta(minutes=int(interval)) if interval.isdigit() and int(interval) < 60 else pd.Timedelta(hours=int(interval) // 60 if interval.isdigit() else 1)
-        if interval == "D":
-            duration = pd.Timedelta(days=1)
-        output = []
-        for row in payload.get("result", {}).get("list", []):
-            try:
-                timestamp = pd.to_datetime(int(row[0]), unit="ms", utc=True)
-                if timestamp + duration > now:
-                    continue
-                output.append({
-                    "Timestamp": timestamp.isoformat(), "Open": float(row[1]),
-                    "High": float(row[2]), "Low": float(row[3]),
-                    "Close": float(row[4]), "Volume": float(row[5]),
-                })
-            except (TypeError, ValueError, IndexError):
-                continue
-        return sorted(output, key=lambda row: row["Timestamp"])[-count:]
-
     result = {"candles": [], "candles_1h": [], "error": None}
+    exchange = None
     try:
-        result["candles"] = fetch("5")
-        result["candles_1h"] = fetch("60")
+        import ccxt
+
+        exchange = ccxt.bybit({
+            "enableRateLimit": True,
+            "timeout": 8000,
+            "options": {"defaultType": "swap"},
+        })
+        exchange.load_markets()
+        market_symbol = str(symbol).strip().upper()
+        if ":" not in market_symbol:
+            market_symbol = f"{market_symbol}:{market_symbol.split('/')[-1]}"
+        market = exchange.market(market_symbol)
+        if not market.get("swap") or not market.get("linear"):
+            raise ValueError(f"{market_symbol} is not a linear perpetual market")
+
+        def fetch(timeframe: str) -> list[dict[str, Any]]:
+            duration = pd.Timedelta(timeframe)
+            # Request one extra bar because public OHLCV endpoints commonly
+            # include the still-forming candle at the end of the response.
+            raw = exchange.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=count + 1)
+            rows = []
+            for item in raw or []:
+                try:
+                    timestamp = pd.to_datetime(int(item[0]), unit="ms", utc=True)
+                    if timestamp + duration > now:
+                        continue
+                    rows.append({
+                        "Timestamp": timestamp.isoformat(), "Open": float(item[1]),
+                        "High": float(item[2]), "Low": float(item[3]),
+                        "Close": float(item[4]), "Volume": float(item[5] or 0),
+                    })
+                except (TypeError, ValueError, IndexError):
+                    continue
+            return rows[-count:]
+
+        result["candles"] = fetch("5m")
+        result["candles_1h"] = fetch("1h")
     except Exception as exc:
         result["error"] = str(exc)[:180]
+    finally:
+        if exchange is not None:
+            try:
+                exchange.close()
+            except Exception:
+                pass
     return result
 
 
@@ -276,9 +285,11 @@ macro_state = _payload(macro_rows[0]) if macro_rows else {}
 active_trades = snapshot["positions"]
 trade_memory = snapshot["memory"]
 
-symbols = sorted(set(market_states) | set(orderflow_states))
-if not symbols:
-    symbols = ["XAU/USD", "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "ADA/USDT:USDT"]
+symbols = sorted(set(market_states) | set(orderflow_states) | {
+    "XAU/USD", "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+    "ADA/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT",
+    "LINK/USDT:USDT", "MATIC/USDT:USDT", "DOT/USDT:USDT",
+})
 selected_symbol = st.selectbox(
     "MARKET SNAPSHOT",
     symbols,
@@ -310,17 +321,18 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 
 
 with tab1:
-    st.markdown("<div class='section-label'>LIVE BINANCE / GOLD-PROXY CANDLE FEED · 5M</div>", unsafe_allow_html=True)
-    candle_rows = market.get("candles", [])
+    st.markdown("<div class='section-label'>LIVE BYBIT / GOLD-PROXY CANDLE FEED · 5M</div>", unsafe_allow_html=True)
     fallback_payload: dict[str, Any] = {}
-    chart_source = "Supabase daemon snapshot"
+    with st.spinner("Fetching 150 latest closed candles and refreshing SMC overlays…"):
+        live_payload = _fetch_live_candles(selected_symbol, 150)
+    fallback_payload = live_payload
+    candle_rows = live_payload.get("candles", []) or []
+    chart_source = "Live Yahoo Finance / Bybit ccxt feed"
     if not candle_rows:
-        chart_source = "Public candle fallback (Yahoo Finance / Bybit REST)"
-        with st.spinner("Loading the latest closed candles and deriving SMC overlays…"):
-            fallback_payload = _fetch_fallback_candles(selected_symbol, 100)
-        candle_rows = fallback_payload.get("candles", []) or []
+        candle_rows = market.get("candles", []) or []
+        chart_source = "Supabase last-known candle snapshot"
     if not candle_rows:
-        message = fallback_payload.get("error") or market.get("status") or "No closed candles were returned."
+        message = live_payload.get("error") or market.get("status") or "No closed candles were returned."
         st.warning(f"Chart data is temporarily unavailable: {message}")
         empty_figure = go.Figure(data=[go.Candlestick(x=[], open=[], high=[], low=[], close=[], name=selected_symbol)])
         empty_figure.update_layout(
@@ -342,10 +354,7 @@ with tab1:
             if candles.empty:
                 st.info("The current market snapshot contains no valid candle rows.")
             else:
-                if not market.get("smc_levels"):
-                    chart_levels = _derive_smc_levels(candles)
-                else:
-                    chart_levels = market.get("smc_levels", []) or []
+                chart_levels = market.get("smc_levels", []) or _derive_smc_levels(candles)
                 fig = go.Figure(data=[go.Candlestick(
                     x=candles["Timestamp"], open=candles["Open"], high=candles["High"],
                     low=candles["Low"], close=candles["Close"], name=selected_symbol,
@@ -357,8 +366,12 @@ with tab1:
                     if low is None or high is None:
                         continue
                     level_type = str(zone.get("type", "SMC zone"))
-                    bullish = "bullish" in level_type.lower()
-                    color = "rgba(0,230,118,0.22)" if bullish else "rgba(255,42,95,0.20)"
+                    lower_type = level_type.lower()
+                    is_order_block = "order block" in lower_type or "ob" == lower_type
+                    bullish = "bullish" in lower_type
+                    color = ("rgba(255,214,0,0.20)" if is_order_block else
+                             "rgba(0,230,118,0.22)" if bullish else "rgba(255,42,95,0.20)")
+                    line_color = "#ffd600" if is_order_block else "#00e676" if bullish else "#ff2a5f"
                     try:
                         zone_start = pd.to_datetime(zone.get("timestamp"), utc=True, errors="coerce")
                         if pd.isna(zone_start) or zone_start < x0:
@@ -367,7 +380,7 @@ with tab1:
                         zone_start = x0
                     fig.add_shape(type="rect", xref="x", yref="y", x0=zone_start, x1=x1,
                                   y0=low, y1=high, fillcolor=color,
-                                  line={"color": "#00e676" if bullish else "#ff2a5f", "width": 1})
+                                  line={"color": line_color, "width": 1})
                 sweep = market.get("sweep_1h") or {}
                 if not sweep and fallback_payload.get("candles_1h"):
                     hourly = pd.DataFrame(fallback_payload["candles_1h"])
@@ -408,12 +421,15 @@ with tab1:
 
 with tab2:
     st.markdown("<div class='section-label'>TOP-DOWN STRUCTURE · 4H → 1H → 15M → 5M</div>", unsafe_allow_html=True)
-    cards = st.columns(4)
-    with cards[0]: _metric_card("4H BIAS", market.get("bias_4h", "AWAITING"))
-    with cards[1]: _metric_card("4H EMA 50 / 200", f"{market.get('ema_50_4h', '—')} / {market.get('ema_200_4h', '—')}")
-    sweep = market.get("sweep_1h") or {}
-    with cards[2]: _metric_card("1H LIQUIDITY", f"{sweep.get('label', 'No recent sweep')} · {sweep.get('price', '—')}")
-    with cards[3]: _metric_card("15M MSS", market.get("mss_15m_status", "AWAITING"))
+    if not market_states:
+        st.info(BOOTING_MESSAGE)
+    else:
+        cards = st.columns(4)
+        with cards[0]: _metric_card("4H BIAS", market.get("bias_4h", "AWAITING"))
+        with cards[1]: _metric_card("4H EMA 50 / 200", f"{market.get('ema_50_4h', '—')} / {market.get('ema_200_4h', '—')}")
+        sweep = market.get("sweep_1h") or {}
+        with cards[2]: _metric_card("1H LIQUIDITY", f"{sweep.get('label', 'No recent sweep')} · {sweep.get('price', '—')}")
+        with cards[3]: _metric_card("15M MSS", market.get("mss_15m_status", "AWAITING"))
     st.markdown("**ACTIVE SETUPS**")
     setup_rows = market.get("setups", []) or []
     if setup_rows:
@@ -462,7 +478,7 @@ with tab3:
 with tab4:
     st.markdown("<div class='section-label'>EXECUTIVE MARKET OBSERVATION · AUTO-REFRESHED BY DAEMON</div>", unsafe_allow_html=True)
     if not macro_state:
-        st.info("No macro briefing has been persisted yet. The daemon publishes a new observation every 30 minutes.")
+        st.info(BOOTING_MESSAGE)
     else:
         source_cols = st.columns(3)
         with source_cols[0]: _metric_card("UPDATED UTC", macro_state.get("updated_at", "—"))
@@ -489,19 +505,14 @@ with tab4:
             st.caption("Source fallback/unavailable this cycle: " + ", ".join(failed_sources[:12]))
         headline_rows = macro_state.get("headlines", []) or []
         if headline_rows:
-            st.markdown("**LATEST CATEGORIZED INTELLIGENCE**")
-            for item in headline_rows[:12]:
-                headline = escape(str(item.get("headline", "")))
-                source = escape(str(item.get("source", "Unknown")))
-                tags = escape(" · ".join(item.get("tags", []) or ["General"]))
-                link = str(item.get("link", ""))
-                link_html = f"<a href='{escape(link, quote=True)}' target='_blank' style='color:#00f0ff;text-decoration:none'>{headline}</a>" if link.startswith(("https://", "http://")) else headline
-                st.markdown(
-                    f"<div style='background:#090e17;border:1px solid #141e2e;border-left:2px solid #ffd600;"
-                    f"padding:9px 12px;margin:5px 0'><div style='font-size:9px;color:#71839e'>{source} · {tags} · {escape(str(item.get('published', '')))}</div>"
-                    f"<div style='color:#e6f1ff;font-size:11px;margin-top:4px'>{link_html}</div></div>",
-                    unsafe_allow_html=True,
-                )
+            st.markdown("**HARVESTED HEADLINES · FULL FEED**")
+            headline_frame = pd.DataFrame([{
+                "Published": item.get("published", ""),
+                "Source": item.get("source", "Unknown"),
+                "Headline": item.get("headline", ""),
+                "Tags": " · ".join(item.get("tags", []) or ["General"]),
+            } for item in headline_rows])
+            st.dataframe(headline_frame, use_container_width=True, hide_index=True)
         else:
             st.info("No parseable macro headlines were returned in this cycle.")
 
@@ -532,7 +543,7 @@ with tab5:
 with tab6:
     st.markdown("<div class='section-label'>BINANCE L2 DEPTH PROFILE · DAEMON SNAPSHOT</div>", unsafe_allow_html=True)
     if not flow:
-        st.info("No Binance order-flow snapshot has been persisted for this market yet.")
+        st.info(BOOTING_MESSAGE)
     elif flow.get("error"):
         st.warning(f"Latest order-book poll failed: {flow.get('error')}")
     else:

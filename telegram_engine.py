@@ -96,6 +96,27 @@ class TelegramBroadcaster:
             thread.join(timeout=max(0.0, timeout))
 
     def _poll_updates(self, status_callback, scan_callback, trades_callback=None):
+        # getUpdates cannot be used while a webhook is active. Clear any old
+        # webhook before the first poll, dropping stale queued commands.
+        try:
+            webhook_response = requests.post(
+                f"{self.base_url}/deleteWebhook",
+                json={"drop_pending_updates": True},
+                timeout=5,
+            )
+            webhook_response.raise_for_status()
+            webhook_payload = webhook_response.json()
+            if not webhook_payload.get("ok", False):
+                print(
+                    "Telegram deleteWebhook rejected: "
+                    f"{webhook_payload.get('description', 'unknown API error')}"
+                )
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            # Polling may still work if there was no webhook; keep the listener
+            # alive and make the failure visible for operators.
+            print(f"Telegram deleteWebhook error: {exc}")
+
+        conflict_backoff = 10
         while not self._stop_event.is_set():
             try:
                 with self._state_lock:
@@ -106,6 +127,7 @@ class TelegramBroadcaster:
                     timeout=12,
                 )
                 response.raise_for_status()
+                conflict_backoff = 10
                 payload = response.json()
                 if payload.get("ok"):
                     for update in payload.get("result", []):
@@ -119,7 +141,18 @@ class TelegramBroadcaster:
                             self._handle_command(
                                 command_text, status_callback, scan_callback, trades_callback
                             )
-            except (requests.RequestException, ValueError, TypeError) as exc:
+            except requests.RequestException as exc:
+                if getattr(getattr(exc, "response", None), "status_code", None) == 409:
+                    print(
+                        "Telegram getUpdates conflict (409); "
+                        f"retrying in {conflict_backoff} seconds."
+                    )
+                    self._stop_event.wait(conflict_backoff)
+                    conflict_backoff = min(conflict_backoff * 2, 120)
+                    continue
+                print(f"Telegram listener polling error: {exc}")
+                self._stop_event.wait(3)
+            except (ValueError, TypeError) as exc:
                 print(f"Telegram listener polling error: {exc}")
                 self._stop_event.wait(3)
             self._stop_event.wait(0.5)
