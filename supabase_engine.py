@@ -82,22 +82,35 @@ class SupabaseEngine:
         table or trade-memory schema; a missing/mismatched table is reported and
         the daemon continues with its in-memory state.
         """
+        return self.save_states(table, [{"state_key": state_key, "payload": payload}])
+
+    def save_states(self, table: str, states: list[dict]) -> bool:
+        """Batch upsert current snapshots, useful for daemon startup priming."""
         if table not in STATE_TABLES:
             raise ValueError(f"Unsupported Aegis state table: {table}")
+        if not states:
+            return True
         if not self.is_configured():
+            key_name = "SUPABASE_SERVICE_ROLE_KEY" if self.service_role else "SUPABASE_KEY"
+            print(f"Supabase {table} write skipped: {key_name} is missing or invalid")
             return False
-        row = {
-            "state_key": str(state_key),
-            "payload": payload,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
+        updated_at = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for state in states:
+            if not isinstance(state, dict) or not state.get("state_key") or not isinstance(state.get("payload"), dict):
+                raise ValueError("Each state row requires a state_key and dictionary payload")
+            rows.append({
+                "state_key": str(state["state_key"]),
+                "payload": state["payload"],
+                "updated_at": updated_at,
+            })
         headers = dict(self.headers)
         headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
         try:
             response = requests.post(
                 f"{self.url}/{table}?on_conflict=state_key",
                 headers=headers,
-                json=row,
+                json=rows,
                 timeout=(3, 8),
             )
             if response.status_code not in (200, 201, 204):
@@ -113,6 +126,8 @@ class SupabaseEngine:
         if table not in STATE_TABLES:
             raise ValueError(f"Unsupported Aegis state table: {table}")
         if not self.is_configured():
+            key_name = "SUPABASE_SERVICE_ROLE_KEY" if self.service_role else "SUPABASE_KEY"
+            print(f"Supabase {table} read skipped: {key_name} is missing or invalid")
             return []
         try:
             response = requests.get(

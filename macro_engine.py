@@ -5,12 +5,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+import json
 import os
 import re
 from typing import Any
 from urllib.parse import urljoin
 
 import feedparser
+import numpy as np
+import pandas as pd
 import requests
 
 
@@ -199,31 +202,148 @@ class MacroHarvester:
         negative = sum(row.get("sentiment") == "Negative" for row in items)
         return "constructive" if positive > negative else "defensive" if negative > positive else "mixed"
 
-    def _synthesize(self, headlines: list[dict[str, Any]]) -> str:
+    @staticmethod
+    def _fetch_market_context() -> dict[str, dict[str, Any]]:
+        """Fetch price/range context so the briefing can state real trend levels."""
+        tickers = ["BTC-USD", "GC=F", "SI=F", "CL=F", "NG=F", "^TNX", "^TYX", "DX-Y.NYB", "^GSPC"]
+        try:
+            import yfinance as yf
+            data = yf.download(
+                tickers=tickers, period="3mo", interval="1d", group_by="ticker",
+                auto_adjust=True, progress=False, threads=True, timeout=8,
+            )
+        except Exception as exc:
+            return {"_error": {"error": str(exc)[:180]}}
+        output: dict[str, dict[str, Any]] = {}
+        for ticker in tickers:
+            try:
+                close = data[ticker]["Close"] if isinstance(data.columns, pd.MultiIndex) else data["Close"]
+                close = pd.to_numeric(close, errors="coerce").dropna()
+                if close.empty:
+                    continue
+                values = close.to_numpy(dtype=float)
+                tail = values[-20:]
+                last = float(values[-1])
+                prior_20 = values[-21:-1] if len(values) > 20 else values[:-1]
+                upper = float(np.max(prior_20)) if len(prior_20) else last
+                lower = float(np.min(prior_20)) if len(prior_20) else last
+                scale = 0.1 if ticker in {"^TNX", "^TYX"} else 1.0
+                pct_5d = ((last / float(values[-6])) - 1) * 100 if len(values) >= 6 and values[-6] else 0.0
+                pct_20d = ((last / float(values[-21])) - 1) * 100 if len(values) >= 21 and values[-21] else 0.0
+                state = "breakout above 20-session range" if last > upper else "breakdown below 20-session range" if last < lower else "consolidating inside 20-session range"
+                output[ticker] = {
+                    "last": last * scale, "change_5d_pct": pct_5d, "change_20d_pct": pct_20d,
+                    "range_low_20d": float(np.min(tail)) * scale, "range_high_20d": float(np.max(tail)) * scale,
+                    "state": state,
+                }
+            except Exception:
+                continue
+        return output
+
+    @staticmethod
+    def _market_line(context: dict[str, dict[str, Any]], ticker: str, label: str) -> str:
+        item = context.get(ticker)
+        if not item:
+            return f"{label} quote context unavailable"
+        return (
+            f"{label} {item['state']} at {item['last']:,.4g}; "
+            f"5-session {item['change_5d_pct']:+.2f}%, 20-session {item['change_20d_pct']:+.2f}%; "
+            f"recent range {item['range_low_20d']:,.4g}–{item['range_high_20d']:,.4g}"
+        )
+
+    def _synthesize(self, headlines: list[dict[str, Any]], market_data: dict[str, dict[str, Any]]) -> str:
         by_tag = {tag: [item for item in headlines if tag in item["tags"]]
                   for tag in self.CATEGORIES}
         crypto, commodities = by_tag["Crypto"], by_tag["Commodities"]
         rates, equities = by_tag["Rates"], by_tag["Equities"]
         dominance = [item for item in crypto if any(word in item["headline"].upper() for word in ("DOMINANCE", "BTC.D", "BITCOIN SHARE"))]
+        etf_flows = [item for item in crypto if any(word in item["headline"].upper() for word in ("ETF", "INFLOW", "OUTFLOW", "FUND FLOW"))]
         gold = [item for item in commodities if any(word in item["headline"].upper() for word in ("GOLD", "XAU"))]
         silver = [item for item in commodities if any(word in item["headline"].upper() for word in ("SILVER", "XAG"))]
+        oil_news = [item for item in commodities if any(word in item["headline"].upper() for word in ("OIL", "CRUDE", "BRENT"))]
+        natgas_news = [item for item in commodities if any(word in item["headline"].upper() for word in ("NATURAL GAS", "LNG", "STORAGE"))]
         yield_items = [item for item in rates if any(word in item["headline"].upper() for word in ("10-YEAR", "10 YEAR", "TREASURY", "YIELD"))]
         hawkish = sum(item["rates_tone"] == "Hawkish" for item in rates)
         dovish = sum(item["rates_tone"] == "Dovish" for item in rates)
         policy = "net hawkish" if hawkish > dovish else "net dovish" if dovish > hawkish else "two-way/mixed"
-        broad = self._tone(headlines)
-        dominance_text = self._tone(dominance) if dominance else "not directly measured in this headline sample"
-        yield_text = self._tone(yield_items) if yield_items else "no direct 10-year yield headline signal"
+        btc = market_data.get("BTC-USD", {})
+        dominance_text = self._tone(dominance) if dominance else "no direct dominance reading in the source sample"
+        flow_text = self._tone(etf_flows) if etf_flows else "no directional ETF flow headline was captured"
+        breakout = btc.get("state", "price state unavailable")
+        if "breakout" in breakout:
+            btc_note = "momentum has cleared its prior 20-session ceiling"
+        elif "breakdown" in breakout:
+            btc_note = "price has slipped below its prior 20-session floor"
+        elif "consolidating" in breakout:
+            btc_note = "price remains inside its recent 20-session range"
+        else:
+            btc_note = "price structure could not be confirmed from the market feed"
+        btc_stats = self._market_line(market_data, "BTC-USD", "Bitcoin")
+        gold_stats = self._market_line(market_data, "GC=F", "Gold")
+        silver_stats = self._market_line(market_data, "SI=F", "Silver")
+        oil_stats = self._market_line(market_data, "CL=F", "WTI crude")
+        gas_stats = self._market_line(market_data, "NG=F", "Natural Gas")
+        ten_year = self._market_line(market_data, "^TNX", "US 10-Year Treasury yield")
+        thirty_year = self._market_line(market_data, "^TYX", "US 30-Year Treasury yield")
+        dxy = self._market_line(market_data, "DX-Y.NYB", "DXY")
+        spx = self._market_line(market_data, "^GSPC", "S&P 500")
+        geo = sum(any(term in row["headline"].upper() for term in ("WAR", "IRAN", "MIDDLE EAST", "GEOPOLIT", "SANCTION", "SHIPPING")) for row in oil_news)
+        seasonality = sum(any(term in row["headline"].upper() for term in ("WINTER", "SUMMER", "SEASONAL", "STORAGE", "WEATHER", "HEATING")) for row in natgas_news)
+        tone = self._tone(headlines)
+        policy_news = "Fed and ECB language leans " + policy if rates else "Fed/ECB policy posture is not explicit in the current headline set"
+        cal_terms = [term for term in ("CPI", "NFP", "JOLTS") if any(term in row["headline"].upper() for row in headlines)]
+        calendar = ", ".join(cal_terms) if cal_terms else "CPI, NFP, and JOLTS remain the scheduled event-risk watchlist; source headlines contained no confirmed release date"
         return (
-            f"Digital assets: {len(crypto)} crypto headlines were captured, with overall headline tone {self._tone(crypto)}. "
-            f"Bitcoin-dominance coverage is {dominance_text}; ETF and flow references are news cues rather than a computed dominance series.\n\n"
-            f"Precious metals and commodities: {len(gold)} gold and {len(silver)} silver headlines were found. "
-            f"Gold coverage reads {self._tone(gold)}, while silver coverage reads {self._tone(silver)}; these are editorial trend cues, not live price trendlines.\n\n"
-            f"Rates and duration: US 10-year yield pressure reads {yield_text} from {len(yield_items)} directly relevant headlines. "
-            f"Across {len(rates)} rates-tagged items, central-bank language is {policy}.\n\n"
-            f"Equities and cross-asset risk: {len(equities)} equity headlines read {self._tone(equities)}, including S&P 500 and earnings references. "
-            f"Across the full sample, broad headline tone is {broad}; monitor event-driven volatility rather than treating sentiment tags as trade signals."
+            f"DIGITAL ASSETS — {btc_stats}. Bitcoin is {btc_note}. ETF net-flow headlines ({len(etf_flows)}) lean {flow_text}; "
+            f"that flow read is editorial rather than a measured fund-flow total. Bitcoin-dominance coverage is {dominance_text}, "
+            f"so sustained BTC leadership would imply a relative headwind for altcoins, while easing dominance would improve their breadth backdrop.\n\n"
+            f"COMMODITIES & PRECIOUS METALS — {gold_stats}; {silver_stats}. The recent 20-session ranges provide working bounce/rejection bands, "
+            f"not technical support guarantees. {oil_stats}; {geo} oil headlines referenced geopolitical or shipping risk. {gas_stats}; "
+            f"{seasonality} Natural Gas headlines referenced weather, storage, or seasonal demand, which are the key seasonal catalysts in this sample.\n\n"
+            f"RATES & GLOBAL YIELDS — {ten_year}; {thirty_year}; {dxy}. {policy_news}. Rising yield and dollar momentum would tighten financial conditions "
+            f"and pressure duration-sensitive risk assets; falling yields or a softer dollar would ease that cross-asset constraint. "
+            f"Rates-source tone was {self._tone(rates)} across {len(rates)} tagged headlines.\n\n"
+            f"EQUITIES & ECONOMIC CALENDAR — {spx}. S&P 500 index direction is a price proxy, not constituent advance/decline breadth; "
+            f"earnings and broad equity headlines ({len(equities)}) read {self._tone(equities)}. Calendar watch: {calendar}. "
+            f"Across all harvested headlines, cross-asset tone is {tone}; treat these observations as context and verify scheduled release times before event risk."
         )
+
+    @staticmethod
+    def _ai_briefing(deterministic: str, headlines: list[dict[str, Any]], market_data: dict[str, dict[str, Any]]) -> str:
+        """Optionally refine the four factual pillars with the configured AI API."""
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            return deterministic
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key, timeout=9.0, max_retries=0)
+            evidence = {
+                "price_context": market_data,
+                "headlines": [{"source": row["source"], "headline": row["headline"], "tags": row["tags"]}
+                              for row in headlines[:50]],
+                "rule_based_note": deterministic,
+            }
+            response = client.chat.completions.create(
+                model=os.getenv("AEGIS_MACRO_MODEL", "gpt-4o-mini"),
+                temperature=0.2,
+                max_tokens=1100,
+                messages=[
+                    {"role": "system", "content": (
+                        "Write an institutional morning market note in exactly four paragraphs. "
+                        "Use these four paragraph headings in order: DIGITAL ASSETS, COMMODITIES & PRECIOUS METALS, "
+                        "RATES & GLOBAL YIELDS, EQUITIES & ECONOMIC CALENDAR. Base all claims only on supplied evidence. "
+                        "Never invent ETF flow amounts, dominance percentages, yield levels, price levels, breadth, or calendar dates. "
+                        "State when a requested measurement is unavailable. Keep the tone concise, analytical, and non-promotional."
+                    )},
+                    {"role": "user", "content": json.dumps(evidence, ensure_ascii=False)},
+                ],
+            )
+            text = str(response.choices[0].message.content or "").strip()
+            paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+            return "\n\n".join(paragraphs) if len(paragraphs) == 4 else deterministic
+        except Exception as exc:
+            print(f"Macro AI synthesis unavailable; deterministic briefing retained: {exc}")
+            return deterministic
 
     def run_cycle(self) -> dict[str, Any]:
         """Fetch sources concurrently and return one JSON-ready database payload."""
@@ -252,9 +372,13 @@ class MacroHarvester:
                     seen.add(key)
         headlines.sort(key=lambda row: (bool(row["published"]), row["published"]), reverse=True)
         headlines = headlines[:120]
+        market_data = self._fetch_market_context()
+        briefing = self._synthesize(headlines, market_data)
+        briefing = self._ai_briefing(briefing, headlines, market_data)
         return {
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "briefing": self._synthesize(headlines),
+            "briefing": briefing,
+            "market_data": market_data,
             "headlines": headlines,
             "sources": source_status,
             "source_count": len(source_status),

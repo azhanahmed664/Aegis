@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -194,13 +195,6 @@ def run_aegis_signal_loop() -> None:
         raise ValueError("ML_CONFIDENCE_THRESHOLD must be between 0 and 1")
 
     print("AEGIS DAEMON ONLINE | Binance USD-M + Gold proxy | market/orderflow 5m, macro 30m")
-    broadcaster = TelegramBroadcaster(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-    ml_engine = LancasterMLEngine()
-    try:
-        print(f"ML startup training: {ml_engine.train_purged_walk_forward()}")
-    except Exception as exc:
-        print(f"ML startup training unavailable; fallback remains active: {exc}")
-    tracker = TradeOutcomeTracker()
     db = SupabaseEngine(service_role=True)
     orderflow_engine = OrderFlowEngine("binance")
     macro_harvester = MacroHarvester()
@@ -224,6 +218,52 @@ def run_aegis_signal_loop() -> None:
             state_write_warning["shown"] = True
         return saved
 
+    def persist_states(table: str, rows: list[dict[str, Any]]) -> bool:
+        try:
+            saved = db.save_states(table, rows)
+        except Exception as exc:
+            saved = False
+            print(f"Supabase state batch write failed for {table}: {exc}")
+        if not saved and not state_write_warning["shown"]:
+            print("State snapshots are not persisting; configure SUPABASE_SERVICE_ROLE_KEY and apply supabase_state_tables.sql")
+            state_write_warning["shown"] = True
+        return saved
+
+    # Publish nonempty startup state immediately so the read-only terminal has
+    # an explicit warming-up state even while upstream providers are responding.
+    startup_time = datetime.now(timezone.utc).isoformat()
+    startup_writes = [
+        ("aegis_market_state", [{
+            "state_key": symbol, "payload": {
+                "symbol": symbol, "updated_at": startup_time, "status": "STARTING",
+                "bias_4h": "AWAITING", "mss_15m_status": "AWAITING",
+                "setups": [], "smc_levels": [], "candles": [],
+            }} for symbol in SYMBOLS]),
+        ("aegis_orderflow_state", [{
+            "state_key": symbol, "payload": {
+                "symbol": symbol, "timestamp": startup_time,
+                "status": "STARTING", "error": "Initial Binance depth poll is queued.",
+            }} for symbol in SYMBOLS]),
+    ]
+    macro_startup_payload = {
+        "updated_at": startup_time, "source_count": len(macro_harvester.SOURCES),
+        "reachable_sources": 0, "sources": [], "headlines": [],
+        "briefing": (
+            "Digital assets: the daemon is collecting current Bitcoin, ETF-flow, and dominance headlines.\n\n"
+            "Commodities and precious metals: Gold, Silver, Crude Oil, and Natural Gas coverage is being harvested.\n\n"
+            "Rates and global yields: US Treasury, DXY, Federal Reserve, and ECB sources are being polled.\n\n"
+            "Equities and economic calendar: S&P 500, earnings, CPI, NFP, and JOLTS coverage is being collected."
+        ),
+    }
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        startup_futures = [pool.submit(persist_states, table, rows) for table, rows in startup_writes]
+        startup_futures.append(pool.submit(persist_state, "aegis_macro_briefing", "latest", macro_startup_payload))
+        for future in startup_futures:
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"Supabase startup state prime failed: {exc}")
+
     def macro_loop() -> None:
         while not stop_event.is_set():
             try:
@@ -241,12 +281,22 @@ def run_aegis_signal_loop() -> None:
     macro_thread = threading.Thread(target=macro_loop, name="aegis-macro-harvester", daemon=True)
     macro_thread.start()
 
-    for symbol in SYMBOLS:
+    broadcaster = TelegramBroadcaster(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    # Both constructors perform a Supabase history read; overlap those waits
+    # so startup scanning is not serialized behind two connection timeouts.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ml_future = pool.submit(LancasterMLEngine)
+        tracker_future = pool.submit(TradeOutcomeTracker)
+        ml_engine = ml_future.result()
+        tracker = tracker_future.result()
+
+    def train_ml_in_background() -> None:
         try:
-            in_memory_cache[symbol] = fetch_mtf_data(symbol, limit=150)
-            print(f"{symbol}: initial MTF cache ready")
+            print(f"ML startup training: {ml_engine.train_purged_walk_forward()}")
         except Exception as exc:
-            print(f"{symbol}: initial MTF cache unavailable; scheduled scan will retry: {exc}")
+            print(f"ML startup training unavailable; fallback remains active: {exc}")
+
+    threading.Thread(target=train_ml_in_background, name="aegis-ml-training", daemon=True).start()
 
     def get_status_summary() -> str:
         try:
@@ -283,13 +333,13 @@ def run_aegis_signal_loop() -> None:
 
     def orderflow_loop() -> None:
         while not stop_event.is_set():
-            delay = seconds_until_next_close()
-            if stop_event.wait(delay):
-                break
             try:
                 scan_orderflow()
             except Exception as exc:
                 print(f"Orderflow cycle failed; worker remains active: {exc}")
+            delay = seconds_until_next_close()
+            if stop_event.wait(delay):
+                break
 
     orderflow_thread = threading.Thread(
         target=orderflow_loop, name="aegis-binance-orderflow", daemon=True
@@ -394,6 +444,12 @@ def run_aegis_signal_loop() -> None:
         scan_callback=lambda: run_scan_cycle("Telegram /scan"),
         trades_callback=get_recent_trades_summary,
     )
+
+    # Do real market work immediately; subsequent cycles stay clock-aligned.
+    try:
+        run_scan_cycle("startup")
+    except Exception as exc:
+        print(f"Startup market scan failed; scheduled worker remains active: {exc}")
 
     try:
         while True:
